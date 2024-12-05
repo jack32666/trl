@@ -55,12 +55,15 @@ from ..trainer.utils import (
     first_true_indices,
     forward,
     get_reward,
+    get_beta,
     prepare_deepspeed,
     print_rich_table,
     truncate_response,
+    sample_timesteps,
 )
 from .rloo_config import RLOOConfig
 from .utils import generate_model_card
+import random
 
 
 if is_wandb_available():
@@ -84,11 +87,13 @@ class RLOOTrainer(Trainer):
         policy: nn.Module,
         ref_policy: nn.Module,
         reward_model: nn.Module,
+        beta_policy: nn.Module,
         train_dataset: Dataset,
         data_collator: Optional[DataCollatorWithPadding] = None,
         eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
         # less commonly used
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
+        beta_optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         callbacks: Optional[list[TrainerCallback]] = None,
     ) -> None:
         if ref_policy is policy:
@@ -113,12 +118,16 @@ class RLOOTrainer(Trainer):
 
         self.ref_policy = ref_policy
         self.reward_model = reward_model
+        self.beta_policy = beta_policy
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
         self.data_collator = data_collator
         self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
+        self.beta_optimizer, self.beta_lr_scheduler = beta_optimizers
         self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
+
+
 
         #########
         # calculate various batch sizes
@@ -155,7 +164,7 @@ class RLOOTrainer(Trainer):
         #########
         # setup model, optimizer, and others
         #########
-        for module in [policy, ref_policy, reward_model]:
+        for module in [policy, ref_policy, reward_model, beta_policy]:
             disable_dropout_in_model(module)
         if args.stop_token and args.stop_token == "eos":
             args.stop_token_id = self.processing_class.eos_token_id
@@ -229,10 +238,14 @@ class RLOOTrainer(Trainer):
             self.ref_policy = prepare_deepspeed(
                 self.ref_policy, args.per_device_train_batch_size, args.fp16, args.bf16
             )
+            self.beta_policy = prepare_deepspeed(
+                self.beta_policy, args.per_device_train_batch_size, args.fp16, args.bf16
+            )
             self.deepspeed = self.model
         else:
             self.ref_policy = self.ref_policy.to(self.accelerator.device)
             self.reward_model = self.reward_model.to(self.accelerator.device)
+            self.beta_policy = self.beta_policy.to(self.accelerator.device)
 
     def get_train_dataloader(self) -> DataLoader:
         return self.dataloader
@@ -244,10 +257,12 @@ class RLOOTrainer(Trainer):
         args = self.args
         accelerator = self.accelerator
         optimizer = self.optimizer
+        beta_optimizer = self.beta_optimizer
         model = self.model
         self.model_wrapped = self.model
         ref_policy = self.ref_policy
         reward_model = self.reward_model
+        beta_policy = self.beta_policy
         processing_class = self.processing_class
         dataloader = self.dataloader
         device = accelerator.device
@@ -279,7 +294,7 @@ class RLOOTrainer(Trainer):
         # trainer state initialization
         self.state.global_step = 0
         self.state.episode = 0
-        self.state.max_steps = (args.num_total_batches * args.num_mini_batches) // 2
+        self.state.max_steps = args.num_total_batches * args.num_mini_batches
         self.state.num_train_epochs = args.total_episodes / self.train_dataset_len
         # Compute absolute values for logging, eval, and save if given as ratio
         if args.logging_steps is not None:
@@ -303,39 +318,43 @@ class RLOOTrainer(Trainer):
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
             with torch.no_grad():
-                queries = data["input_ids"].to(device)
-                queries = queries.repeat(args.rloo_k, 1)
-                context_length = queries.shape[1]
+                queries = data["input_ids"].to(device) # torch.Size([8, 64])
+                queries = queries.repeat(args.rloo_k, 1) # torch.Size([16, 64]). For computing variance of the rewards per prompt
+                context_length = queries.shape[1] # 64
                 responses = []
                 postprocessed_responses = []
                 logprobs = []
                 ref_logprobs = []
                 scores = []
                 sequence_lengths = []
+                alpha_list = []
+                beta_list = []
                 with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                    # query_responses.shape: torch.Size([16, 117])
+                    # logitss.shape: torch.Size([16, 53, 50304]). [batch_size, sequence_length, vocab_size]. sequence_length: number of tokens in the generated response. vocab_size: logits over the entire vocabulary
                     query_responses, logitss = batch_generation(
                         unwrapped_model,
-                        queries,
-                        args.local_rollout_forward_batch_size,
-                        processing_class.pad_token_id,
+                        queries, # torch.Size([16, 64])
+                        args.local_rollout_forward_batch_size, # Per rank no grad forward pass in the rollout phase.
+                        processing_class.pad_token_id, # processing_class.pad_token_id: 50277, corresponds to the padding token <pad> in the tokenizer's vocabulary.
                         generation_config,
                     )
 
                 for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
-                    query = queries[i : i + args.local_rollout_forward_batch_size]
-                    query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
-                    response = query_response[:, context_length:]
-                    logits = logitss[i : i + args.local_rollout_forward_batch_size]
-                    all_logprob = F.log_softmax(logits, dim=-1)
-                    logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
+                    query = queries[i : i + args.local_rollout_forward_batch_size] # torch.Size([1, 64])
+                    query_response = query_responses[i : i + args.local_rollout_forward_batch_size] # torch.Size([1, 117])
+                    response = query_response[:, context_length:] # torch.Size([1, 53]), since query_response is composed of cat(query, response)
+                    logits = logitss[i : i + args.local_rollout_forward_batch_size] # torch.Size([1, 53, 50304])
+                    all_logprob = F.log_softmax(logits, dim=-1) # torch.Size([1, 53, 50304])
+                    logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1) # torch.Size([1, 53]). log prob of each token in response
                     del logits, all_logprob
-                    torch.cuda.empty_cache()
+                    torch.cuda.empty_cache() # clear up any memory 
 
                     ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
                     ref_logits = ref_output.logits[:, context_length - 1 : -1]
                     ref_logits /= args.temperature + 1e-7
                     ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
-                    ref_logprob = torch.gather(ref_all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
+                    ref_logprob = torch.gather(ref_all_logprob, 2, response.unsqueeze(-1)).squeeze(-1) # log prob of the response in reference policy
                     del ref_output, ref_logits, ref_all_logprob
                     torch.cuda.empty_cache()
 
@@ -347,10 +366,15 @@ class RLOOTrainer(Trainer):
                         )
 
                     # Response Processing 2. run reward model on the truncated responses
-                    postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
-                    _, score, _ = get_reward(
+                    postprocessed_query_response = torch.cat((query, postprocessed_response), 1) # torch.Size([1, 116])
+                    sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1 # torch.Size([1]): tensor([52])
+                    _, score, _ = get_reward( # torch.Size([1]): tensor([-3.6719])
                         reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    )
+
+                    # generate beta
+                    alpha, beta = get_beta(  # torch.Size([1])
+                        beta_policy, postprocessed_query_response, processing_class.pad_token_id
                     )
 
                     responses.append(response)
@@ -359,85 +383,99 @@ class RLOOTrainer(Trainer):
                     ref_logprobs.append(ref_logprob)
                     sequence_lengths.append(sequence_length)
                     scores.append(score)
-                responses = torch.cat(responses, 0)
-                postprocessed_responses = torch.cat(postprocessed_responses, 0)
-                logprobs = torch.cat(logprobs, 0)
-                ref_logprobs = torch.cat(ref_logprobs, 0)
-                sequence_lengths = torch.cat(sequence_lengths, 0)
-                scores = torch.cat(scores, 0)
-                del (logprob, ref_logprob, score)
+                    alpha_list.append(alpha)
+                    beta_list.append(beta)
+                    
+                responses = torch.cat(responses, 0) # torch.Size([16, 53]). concatenate a list of tensors along the first dimension (dimension 0).. If yo;u use torck.stack, it would inttroduce a new dimension at first dimension.
+                postprocessed_responses = torch.cat(postprocessed_responses, 0) # torch.Size([16, 53])
+                logprobs = torch.cat(logprobs, 0) # torch.Size([16, 53])
+                ref_logprobs = torch.cat(ref_logprobs, 0) # torch.Size([16, 53])
+                sequence_lengths = torch.cat(sequence_lengths, 0) # torch.Size([16])
+                scores = torch.cat(scores, 0) # torch.Size([16])
+                alpha_tensor = torch.cat(alpha_list, 0) # torch.Size([16])
+                beta_tensor = torch.cat(beta_list, 0) # torch.Size([16])
+                
+
+                #################### BEFORE RLHF UPDATE ####################
+                evaluate_score_before = self.evaluate_score(sampling=False) # torch.Size([16])
+                sampled_kl_coef, beta_log_probs, beta_distr_entropy = sample_timesteps(alpha_tensor, beta_tensor) # torch.Size([16]), torch.Size([16]), torch.Size([16])
+                
+                del (logprob, ref_logprob, score, alpha_list, beta_list)
                 torch.cuda.empty_cache()
-                gc.collect()
+                gc.collect() # release memory 
 
                 # Response Processing 3. filter response. Ensure that the sample contains stop_token_id
                 # responses not passing that filter will receive a low (fixed) score
                 # only query humans on responses that pass that filter
-                contain_eos_token = torch.any(postprocessed_responses == processing_class.eos_token_id, dim=-1)
+                contain_eos_token = torch.any(postprocessed_responses == processing_class.eos_token_id, dim=-1) # torch.Size([16])
                 if args.missing_eos_penalty is not None:
-                    scores[~contain_eos_token] -= self.args.missing_eos_penalty
+                    scores[~contain_eos_token] -= self.args.missing_eos_penalty # penalize responses missing EOS token by subtracting 1
                 # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
 
                 # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
-                response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1)
-                padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
-                logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
-                ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
+                response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1) # torch.Size([16, 53])
+                padding_mask = response_idxs > sequence_lengths.unsqueeze(1) # torch.Size([16, 53])
+                logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB) # INVALID_LOGPROB: 1.0. torch.Size([16, 53]). Ignore padding tokens in calculations. Having a 1.0 ensures a large, noticeable penalty for invalid positions (log(1)=0).
+                ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB) # torch.Size([16, 53])
 
                 # 4. compute rewards
-                kl = logprobs - ref_logprobs
-                non_score_reward = (-args.kl_coef * kl).sum(1)
-                rlhf_reward = scores + non_score_reward
+                kl = logprobs - ref_logprobs # torch.Size([16, 53])
+                non_score_reward = (-args.kl_coef * kl).sum(1) # args.kl_coef: 0.05
+                rlhf_reward = scores + non_score_reward # torch.Size([16])
 
                 # vectorized RLOO advantages implementation
-                rlhf_reward = rlhf_reward.reshape(args.rloo_k, -1)
-                baseline = (rlhf_reward.sum(0) - rlhf_reward) / (args.rloo_k - 1)
-                advantages = rlhf_reward - baseline
-                advantages = advantages.flatten()
+                rlhf_reward = rlhf_reward.reshape(args.rloo_k, -1) # torch.Size([2, 8])
+                baseline = (rlhf_reward.sum(0) - rlhf_reward) / (args.rloo_k - 1) # rlhf_reward.sum(0): torch.Size([8])
+                advantages = rlhf_reward - baseline # torch.Size([2, 8])
+                advantages = advantages.flatten() # torch.Size([16])
                 torch.cuda.empty_cache()
 
+
+            #################### RLHF UPDATE ####################
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
             for ppo_epoch_idx in range(args.num_ppo_epochs):
                 b_inds = np.random.permutation(args.local_batch_size)
                 minibatch_idx = 0
-                for mini_batch_start in range(0, args.local_batch_size, args.local_mini_batch_size):
+                for mini_batch_start in range(0, args.local_batch_size, args.local_mini_batch_size): # PPO update. args.local_mini_batch_size: 16
                     mini_batch_end = mini_batch_start + args.local_mini_batch_size
                     mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
                     gradient_accumulation_idx = 0
-                    for micro_batch_start in range(0, args.local_mini_batch_size, args.per_device_train_batch_size):
+                    for micro_batch_start in range(0, args.local_mini_batch_size, args.per_device_train_batch_size): # Gradient Accumulation
                         with accelerator.accumulate(model):
-                            micro_batch_end = micro_batch_start + args.per_device_train_batch_size
-                            micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
-                            mb_advantage = advantages[micro_batch_inds]
-                            mb_responses = responses[micro_batch_inds]
-                            mb_query_responses = query_responses[micro_batch_inds]
-                            mb_logprobs = logprobs[micro_batch_inds]
+                            micro_batch_end = micro_batch_start + args.per_device_train_batch_size # args.per_device_train_batch_size: 1
+                            micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end] # (1,)
+                            mb_advantage = advantages[micro_batch_inds] # torch.Size([1])
+                            mb_responses = responses[micro_batch_inds] # torch.Size([1, 53])
+                            mb_query_responses = query_responses[micro_batch_inds] # torch.Size([1, 117])
+                            mb_logprobs = logprobs[micro_batch_inds] # torch.Size([1, 53])
 
-                            output = forward(model, mb_query_responses, processing_class.pad_token_id)
-                            logits = output.logits[:, context_length - 1 : -1]
-                            logits /= args.temperature + 1e-7
-                            new_all_logprobs = F.log_softmax(logits, dim=-1)
-                            new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
+                            output = forward(model, mb_query_responses, processing_class.pad_token_id) # odict_keys(['logits', 'past_key_values', 'hidden_states'])
+                            logits = output.logits[:, context_length - 1 : -1] # output.logit: torch.Size([1, 117, 50304]), logits: torch.Size([1, 53, 50304])
+                            logits /= args.temperature + 1e-7 # temperature: T>1, reduces their magnitude, making the differences between logits smaller, increasing randomness and encouraging diverse outputs. Ex. Generating poetry, stories, or jokes
+                                                              # temperature: T<1, amplifies logit differences, making the highest logit dominate the probabilities. Ex. answers to factual questions, summarization
+                            new_all_logprobs = F.log_softmax(logits, dim=-1) # torch.Size([1, 53, 50304])
+                            new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1) # torch.Size([1, 53])
                             new_logprobs = torch.masked_fill(
                                 new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
                             )
-                            new_ratio = (new_logprobs - mb_logprobs).exp()
-                            new_logprobs = new_logprobs.sum(1)
-                            mb_logprobs = mb_logprobs.sum(1)
-                            logprobs_diff = new_logprobs - mb_logprobs
-                            ratio = torch.exp(logprobs_diff)
-                            pg_losses = -mb_advantage * ratio
-                            pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
-                            pg_loss_max = torch.max(pg_losses, pg_losses2)
+                            new_ratio = (new_logprobs - mb_logprobs).exp() # torch.Size([1, 53])
+                            new_logprobs = new_logprobs.sum(1) # torch.Size([1])
+                            mb_logprobs = mb_logprobs.sum(1) # torch.Size([1])
+                            logprobs_diff = new_logprobs - mb_logprobs # torch.Size([1])
+                            ratio = torch.exp(logprobs_diff) # torch.Size([1])
+                            pg_losses = -mb_advantage * ratio # torch.Size([1])
+                            pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange) # torch.Size([1])
+                            pg_loss_max = torch.max(pg_losses, pg_losses2) # torch.Size([1])
                             pg_loss = pg_loss_max.mean()
                             loss = pg_loss
                             accelerator.backward(loss)
                             optimizer.step()
                             optimizer.zero_grad()
                             with torch.no_grad():
-                                pg_clipfrac = (pg_losses2 > pg_losses).float().mean()
-                                prob_dist = torch.nn.functional.softmax(logits, dim=-1)
-                                entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
-                                approxkl = 0.5 * (logprobs_diff**2).mean()
+                                pg_clipfrac = (pg_losses2 > pg_losses).float().mean() # torch.Size([])
+                                prob_dist = torch.nn.functional.softmax(logits, dim=-1) # torch.Size([1, 53, 50304])
+                                entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1) # torch.Size([1, 53])
+                                approxkl = 0.5 * (logprobs_diff**2).mean() # torch.Size([])
                                 approxkl_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
                                 pg_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = (
                                     pg_clipfrac
@@ -457,6 +495,17 @@ class RLOOTrainer(Trainer):
                     )
                     # fmt: on
                     torch.cuda.empty_cache()
+                    
+            #################### AFTER RLHF UPDATE ####################
+            evaluate_score_after = self.evaluate_score(sampling=False) # torch.Size([16])
+                    
+            beta_reward = evaluate_score_after - evaluate_score_before # torch.Size([16])
+            actor_loss = -(beta_log_probs * beta_reward.detach()) # torch.Size([16])
+            actor_loss = actor_loss.mean() # torch.Size([])
+            accelerator.backward(actor_loss)
+            beta_optimizer.step()
+            beta_optimizer.zero_grad()
+                    
             with torch.no_grad():
                 mean_kl = kl.sum(1).mean()
                 mean_entropy = (-logprobs).sum(1).mean()
@@ -464,7 +513,7 @@ class RLOOTrainer(Trainer):
                 eps = int(self.state.episode / (time.time() - start_time))
                 metrics = {}
                 metrics["eps"] = eps
-                metrics["objective/kl"] = self.accelerator.gather(mean_kl).mean().item()
+                metrics["objective/kl"] = self.accelerator.gather(mean_kl).mean().item() # gather tensors from all processes (across multiple GPUs or devices) during distributed training.
                 metrics["objective/entropy"] = self.accelerator.gather(mean_entropy).mean().item()
                 metrics["objective/non_score_reward"] = self.accelerator.gather(mean_non_score_reward).mean().item()
                 metrics["objective/rlhf_reward"] = self.accelerator.gather(rlhf_reward).mean().item()
@@ -492,6 +541,7 @@ class RLOOTrainer(Trainer):
             torch.cuda.empty_cache()
             gc.collect()
 
+            # args.num_sample_generations: 10. update: 1. self.sample_generations_freq: 15.
             if args.num_sample_generations > 0 and (update - 1) % self.sample_generations_freq == 0:
                 self.generate_completions(sampling=True)
 
@@ -515,18 +565,18 @@ class RLOOTrainer(Trainer):
         table = defaultdict(list)
         with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
             for batch in self.eval_dataloader:
-                query = batch["input_ids"]
+                query = batch["input_ids"] # torch.Size([8, 63])
                 with torch.no_grad():
-                    context_length = query.shape[1]
-                    query_response, _ = batch_generation(
+                    context_length = query.shape[1] # 63
+                    query_response, _ = batch_generation( # torch.Size([8, 116])
                         unwrapped_model,
                         query,
                         query.shape[0],
                         processing_class.pad_token_id,
                         generation_config,
                     )
-                    response = query_response[:, context_length:]
-                    postprocessed_response = response
+                    response = query_response[:, context_length:] # torch.Size([8, 53])
+                    postprocessed_response = response # torch.Size([8, 53])
                     if args.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
                         postprocessed_response = truncate_response(
                             args.stop_token_id, processing_class.pad_token_id, response
@@ -538,8 +588,8 @@ class RLOOTrainer(Trainer):
                         gather_object(processing_class.batch_decode(postprocessed_response))
                     )
 
-                    postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    _, score, _ = get_reward(
+                    postprocessed_query_response = torch.cat((query, postprocessed_response), 1) # query: torch.Size([8, 60]). postprocessed_response: torch.Size([8, 53]).
+                    _, score, _ = get_reward( # torch.Size([8])
                         self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
                     )
                     table["score"].extend(self.accelerator.gather(score).float().cpu().numpy())
@@ -555,7 +605,58 @@ class RLOOTrainer(Trainer):
 
                 if wandb.run is not None:
                     wandb.log({"completions": wandb.Table(dataframe=df)})
+                    wandb.log({"val/scores": np.mean(df['score'])})
+                    
+    def evaluate_score(self, sampling: bool = False):
+        args = self.args
+        processing_class = self.processing_class
+        generation_config = GenerationConfig(
+            max_new_tokens=self.args.response_length,
+            temperature=(0.01 + 1e-7),
+            top_k=0.0,
+            top_p=1.0,
+            do_sample=True,
+        )
 
+        score_list = []
+        with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+            dataloader_batches = list(self.eval_dataloader)
+            random.shuffle(dataloader_batches)  # Shuffle the batches
+            batch_count = 0
+
+            for batch in dataloader_batches:
+                query = batch["input_ids"]  # torch.Size([8, 63])
+                with torch.no_grad():
+                    context_length = query.shape[1]  # 63
+                    query_response, _ = batch_generation(  # torch.Size([8, 116])
+                        unwrapped_model,
+                        query,
+                        query.shape[0],
+                        processing_class.pad_token_id,
+                        generation_config,
+                    )
+                    response = query_response[:, context_length:]  # torch.Size([8, 53])
+                    postprocessed_response = response  # torch.Size([8, 53])
+                    if args.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
+                        postprocessed_response = truncate_response(
+                            args.stop_token_id, processing_class.pad_token_id, response
+                        )
+
+                    postprocessed_query_response = torch.cat((query, postprocessed_response), 1)  # query: torch.Size([8, 60]). postprocessed_response: torch.Size([8, 53]).
+                    _, score, _ = get_reward(  # torch.Size([8])
+                        self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    )
+                    score_list.append(score)
+
+                batch_count += 1
+                if batch_count == 2 or sampling:
+                    break
+
+        score_tensor = torch.cat(score_list, 0)  # torch.Size([16])
+
+        return score_tensor
+
+                    
     def create_model_card(
         self,
         model_name: Optional[str] = None,
