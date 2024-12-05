@@ -50,6 +50,7 @@ from transformers.utils import (
 
 from ..import_utils import is_unsloth_available
 from ..trainer.model_config import ModelConfig
+from torch.distributions import Beta
 
 
 if is_peft_available():
@@ -136,8 +137,7 @@ class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
                 "The pad_token_id and eos_token_id values of this tokenizer are identical. "
                 "If you are planning for multi-turn training, "
                 "it can result in the model continuously generating questions and answers without eos token. "
-                "To avoid this, set the pad_token_id to a different value.",
-                UserWarning,
+                "To avoid this, set the pad_token_id to a different value."
             )
 
         self.ignore_index = ignore_index
@@ -160,10 +160,10 @@ class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
 
                 if response_token_ids_start_idx is None:
                     warnings.warn(
-                        f"Could not find response key `{self.response_template}` in the following instance: "
-                        f"{self.tokenizer.decode(batch['input_ids'][i])}. This instance will be ignored in loss "
-                        "calculation. Note, if this happens often, consider increasing the `max_seq_length`.",
-                        UserWarning,
+                        f"Could not find response key `{self.response_template}` in the "
+                        f'following instance: {self.tokenizer.decode(batch["input_ids"][i])} '
+                        f"This instance will be ignored in loss calculation. "
+                        f"Note, if this happens often, consider increasing the `max_seq_length`."
                     )
                     batch["labels"][i, :] = self.ignore_index
                 else:
@@ -187,10 +187,10 @@ class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
 
                 if len(response_token_ids_idxs) == 0:
                     warnings.warn(
-                        f"Could not find response key `{self.response_template}` in the following instance: "
-                        f"{self.tokenizer.decode(batch['input_ids'][i])}. This instance will be ignored in loss "
-                        "calculation. Note, if this happens often, consider increasing the `max_seq_length`.",
-                        UserWarning,
+                        f"Could not find response key `{self.response_template}` in the "
+                        f'following instance: {self.tokenizer.decode(batch["input_ids"][i])} '
+                        f"This instance will be ignored in loss calculation. "
+                        f"Note, if this happens often, consider increasing the `max_seq_length`."
                     )
                     batch["labels"][i, :] = self.ignore_index
 
@@ -202,10 +202,10 @@ class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
 
                 if len(human_token_ids_idxs) == 0:
                     warnings.warn(
-                        f"Could not find instruction key `{self.instruction_template}` in the following instance: "
-                        f"{self.tokenizer.decode(batch['input_ids'][i])}. This instance will be ignored in loss "
-                        "calculation. Note, if this happens often, consider increasing the `max_seq_length`.",
-                        UserWarning,
+                        f"Could not find instruction key `{self.instruction_template}` in the "
+                        f'following instance: {self.tokenizer.decode(batch["input_ids"][i])} '
+                        f"This instance will be ignored in loss calculation. "
+                        f"Note, if this happens often, consider increasing the `max_seq_length`."
                     )
                     batch["labels"][i, :] = self.ignore_index
 
@@ -593,6 +593,13 @@ class ConstantLengthDataset(IterableDataset):
         add_special_tokens=True,
     ):
         self.tokenizer = tokenizer
+
+        if tokenizer.eos_token_id is None:
+            warnings.warn(
+                "The passed tokenizer does not have an EOS token. We will use the passed eos_token_id instead which corresponds"
+                f" to {eos_token_id}. If this is not the correct EOS token, make sure to pass the correct eos_token_id."
+            )
+
         self.concat_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id else eos_token_id
         self.dataset = dataset
         self.seq_length = seq_length
@@ -606,8 +613,7 @@ class ConstantLengthDataset(IterableDataset):
         if dataset_text_field is not None and formatting_func is not None:
             warnings.warn(
                 "Only one of `dataset_text_field` and `formatting_func` should be provided. "
-                "Ignoring `dataset_text_field` and using `formatting_func`.",
-                UserWarning,
+                "Ignoring `dataset_text_field` and using `formatting_func`."
             )
 
         if formatting_func is not None:
@@ -617,6 +623,12 @@ class ConstantLengthDataset(IterableDataset):
         else:  # neither is provided
             raise ValueError("Either `dataset_text_field` or `formatting_func` should be provided.")
 
+        if formatting_func is not None:
+            if formatting_func.__code__.co_argcount > 1:
+                warnings.warn(
+                    "The passed formatting_func has more than one argument. Usually that function should have a single argument `example`"
+                    " which corresponds to the dictionary returned by each element of the dataset. Make sure you know what you are doing."
+                )
         self.pretokenized = False
         column_names = (
             dataset.column_names if isinstance(dataset, (datasets.Dataset, datasets.IterableDataset)) else None
@@ -643,6 +655,7 @@ class ConstantLengthDataset(IterableDataset):
                 except StopIteration:
                     if self.infinite:
                         iterator = iter(self.dataset)
+                        warnings.warn("The dataset reached end and the iterator is reset to the start.")
                     else:
                         more_examples = False
                         break
@@ -759,12 +772,9 @@ def compute_accuracy(eval_pred) -> dict[str, float]:
     predictions, labels = eval_pred
     # Here, predictions is rewards_chosen and rewards_rejected.
     # We want to see how much of the time rewards_chosen > rewards_rejected.
-    equal_predictions_count = np.array(predictions[:, 0] == predictions[:, 1], dtype=float).sum()
-    if equal_predictions_count > 0:
+    if np.array(predictions[:, 0] == predictions[:, 1], dtype=float).sum() > 0:
         warnings.warn(
-            f"There are {equal_predictions_count} out of {len(predictions[:, 0])} instances where the predictions for "
-            "both options are equal. As a consequence the accuracy can be misleading.",
-            UserWarning,
+            f"There are {np.array(predictions[:, 0] == predictions[:, 1]).sum()} out of {len(predictions[:, 0])} instances where the predictions for both options are equal. As a consequence the accuracy can be misleading."
         )
     predictions = np.argmax(predictions, axis=1)
 
@@ -1110,13 +1120,57 @@ def get_reward(
     sequence_lengths = first_true_indices(query_responses[:, context_length:] == pad_token_id) - 1 + context_length
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
     return (
-        reward_logits,
+        reward_logits, # torch.Size([1, 117, 1])
         reward_logits[
             torch.arange(reward_logits.size(0), device=reward_logits.device),
             sequence_lengths,
-        ].squeeze(-1),
-        sequence_lengths,
+        ].squeeze(-1), # torch.Size([1])
+        sequence_lengths, # torch.Size([1])
     )
+
+
+def get_beta(
+    model: torch.nn.Module,
+    query_responses: torch.Tensor,
+    pad_token_id: int,
+) -> torch.nn.Module:
+    """
+    Performs a forward pass through the model with the given query responses and pad token ID.
+
+    Args:
+        model (`torch.nn.Module`):
+            The model to perform the forward pass.
+        query_responses (`torch.Tensor`):
+            The tensor containing the query responses.
+        pad_token_id (`int`):
+            The token ID representing the pad token.
+
+    Returns:
+        `torch.nn.Module`:
+            The output of the model, including hidden states.
+    """
+    
+
+    attention_mask = query_responses != pad_token_id # torch.Size([1, 116])
+    position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum. torch.Size([1, 116])
+    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0) # torch.Size([1, 116])
+    
+    # Extract beta coefficients (alpha and beta)
+    alpha, beta = model(input_ids=input_ids, 
+                        attention_mask=attention_mask, 
+                        position_ids=position_ids, 
+                        return_dict=True, 
+                        output_hidden_states=True)
+    
+    return alpha, beta
+
+def sample_timesteps(alpha, beta):
+    dist = Beta(alpha, beta) # torch.Size([16])
+    sampled_kl_coef = dist.sample() # torch.Size([16])
+    log_probs = dist.log_prob(sampled_kl_coef) # torch.Size([16])
+    entropy = dist.entropy() # torch.Size([16])
+
+    return sampled_kl_coef, log_probs, entropy
 
 
 def forward(
@@ -1279,23 +1333,23 @@ def batch_generation(
     logitss = []
     batch_size = queries.shape[0]
     for i in range(0, batch_size, local_rollout_forward_batch_size):
-        query = queries[i : i + local_rollout_forward_batch_size]
+        query = queries[i : i + local_rollout_forward_batch_size] # torch.Size([1, 64])
         query_response, logits = generate(
             model,
             query,
-            pad_token_id,
-            generation_config,
+            pad_token_id, # 50277
+            generation_config, 
         )
-        query_responses.append(query_response)
-        logitss.append(logits)
+        query_responses.append(query_response) # torch.Size([1, 116], torch.Size([1, 112], ...
+        logitss.append(logits) # torch.Size([1, 53, 50304])
 
     # padding tensors
-    padded_query_responses = pad(query_responses, padding_value=pad_token_id, padding_side="right")
-    padded_logitss = pad(logitss, padding_value=0, padding_side="right")
+    padded_query_responses = pad(query_responses, padding_value=pad_token_id, padding_side="right") # torch.Size([16, 1, 116])
+    padded_logitss = pad(logitss, padding_value=0, padding_side="right") # torch.Size([16, 1, 53, 50304])
 
     # reshaping
-    padded_query_responses = padded_query_responses.view(-1, padded_query_responses.shape[-1])[:batch_size]
-    padded_logitss = padded_logitss.view(-1, *padded_logitss.shape[2:])[:batch_size]
+    padded_query_responses = padded_query_responses.view(-1, padded_query_responses.shape[-1])[:batch_size] # torch.Size([16, 116]), pad to the biggest dimension
+    padded_logitss = padded_logitss.view(-1, *padded_logitss.shape[2:])[:batch_size] # torch.Size([16, 53, 50304])
 
     return padded_query_responses, padded_logitss
 
